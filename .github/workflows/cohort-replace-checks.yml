@@ -1,0 +1,217 @@
+# Runs the checks for the static cohort replace work (PostHog/posthog#121486) on free GitHub-hosted runners, against
+# any ref of jadibdev/posthog. It replaces the codespace for heavy validation: each run starts fresh, so it installs
+# from the ref's own lockfile and migrates from scratch.
+#
+# The environment follows PostHog's own backend CI (.depot/workflows/ci-backend.yml): the same service containers
+# through bin/ci-wait-for-docker, Python 3.14.7 with `uv sync --frozen --dev`, the service hostnames in /etc/hosts,
+# sqlx-cli for the persons database, and an out-of-process migrate before `pytest --reuse-db`.
+#
+# Trigger: Actions tab, "Cohort replace checks", Run workflow. Or:
+#   gh workflow run cohort-replace-checks.yml -R <repo holding this file> -f ref=<branch or sha> -f commits=10
+name: Cohort replace checks
+
+on:
+    workflow_dispatch:
+        inputs:
+            ref:
+                description: Branch, tag or full commit SHA of jadibdev/posthog to check
+                required: true
+            commits:
+                description: How many commits at the tip of the ref to lint one by one (the branch's own commits)
+                required: true
+                default: '10'
+            tests:
+                description: Run the test suites (false runs only the lint job)
+                type: boolean
+                default: true
+
+permissions:
+    contents: read
+
+concurrency:
+    group: cohort-replace-checks-${{ inputs.ref }}
+    cancel-in-progress: false
+
+env:
+    SOURCE_REPO: jadibdev/posthog
+    PYTHON_VERSION: 3.14.7
+    PY_DEPS_SYNC_TIMEOUT: 600s
+    # Test-only values, the same as PostHog's backend CI.
+    SECRET_KEY: '6b01eee4f945ca25045b5aab440b953461faf08693a9abbf1166dc7c6b9772da' # unsafe - for testing only
+    DATABASE_URL: 'postgres://posthog:posthog@localhost:5432/posthog'
+    REDIS_URL: 'redis://localhost'
+    CLICKHOUSE_HOST: 'localhost'
+    CLICKHOUSE_SECURE: 'False'
+    CLICKHOUSE_VERIFY: 'False'
+    TEST: 1
+    OBJECT_STORAGE_ENABLED: 'True'
+    OBJECT_STORAGE_ENDPOINT: 'http://localhost:19000'
+    OBJECT_STORAGE_ACCESS_KEY_ID: 'object_storage_root_user'
+    OBJECT_STORAGE_SECRET_ACCESS_KEY: 'object_storage_root_password'
+
+jobs:
+    lint:
+        name: Lint each commit, ruff and mypy
+        runs-on: ubuntu-24.04
+        timeout-minutes: 40
+        steps:
+            - name: Check out the ref
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  repository: ${{ env.SOURCE_REPO }}
+                  ref: ${{ inputs.ref }}
+                  # Enough history to lint the branch's commits one by one.
+                  fetch-depth: 60
+
+            - name: Set up Python
+              uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+              with:
+                  python-version: ${{ env.PYTHON_VERSION }}
+
+            - name: Install uv
+              uses: ./.github/actions/setup-uv
+              with:
+                  save-cache: 'false'
+
+            - name: Install SAML dependencies
+              run: sudo apt-get update && sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl
+
+            - name: Install Python dependencies from the ref's lockfile
+              run: UV_PROJECT_ENVIRONMENT=$pythonLocation timeout --kill-after=10s "$PY_DEPS_SYNC_TIMEOUT" uv sync --frozen --dev
+
+            - name: Each commit imports cleanly (no undefined, unused or redefined names)
+              env:
+                  COMMITS: ${{ inputs.commits }}
+              run: |
+                  set -uo pipefail
+                  base=$(git rev-parse "HEAD~${COMMITS}")
+                  echo "Checking $(git rev-list --count "$base..HEAD") commits after $(git log -1 --format='%h %s' "$base")"
+                  findings=0
+                  for c in $(git rev-list --reverse "$base..HEAD"); do
+                      echo "::group::$(git log -1 --format='%h %s' "$c")"
+                      for f in $(git diff-tree --no-commit-id --name-only --diff-filter=d -r "$c" -- '*.py'); do
+                          out=$(git show "$c:$f" | ruff check --select F821,F401,F811,F841 --stdin-filename "$f" --output-format concise -q - || true)
+                          if [ -n "$out" ]; then echo "$out"; findings=$((findings + 1)); fi
+                      done
+                      echo "::endgroup::"
+                  done
+                  echo "Files with findings: $findings"
+                  [ "$findings" -eq 0 ]
+
+            - name: ruff on the files the branch changes
+              if: ${{ !cancelled() }}
+              env:
+                  COMMITS: ${{ inputs.commits }}
+              run: |
+                  files=$(git diff --name-only --diff-filter=d "HEAD~${COMMITS}" HEAD -- '*.py')
+                  echo "$files"
+                  ruff check $files
+                  ruff format --check $files
+
+            - name: mypy on the cohort replace files
+              if: ${{ !cancelled() }}
+              run: |
+                  mypy posthog/tasks/calculate_cohort.py products/cohorts/backend/models/util.py \
+                      products/cohorts/backend/models/cohort.py posthog/api/cohort.py \
+                      posthog/tasks/test/test_calculate_cohort.py posthog/api/test/test_cohort.py
+
+    tests:
+        name: Migrations and test suites
+        if: ${{ inputs.tests }}
+        runs-on: ubuntu-24.04
+        timeout-minutes: 150
+        steps:
+            - name: Free disk space for the service images
+              # A hosted runner starts with about 14 GB free; the service images and the Python environment need more.
+              run: |
+                  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+                  df -h /
+
+            - name: Check out the ref
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  repository: ${{ env.SOURCE_REPO }}
+                  ref: ${{ inputs.ref }}
+
+            - name: Start services
+              env:
+                  COMPOSE_FILE: docker-compose.dev.yml:docker-compose.profiles.yml
+              run: |
+                  cp posthog/user_scripts/latest_user_defined_function.xml docker/clickhouse/user_defined_function.xml
+                  nohup bin/ci-wait-for-docker launch --background --down \
+                    db redis7 clickhouse zookeeper kafka objectstorage </dev/null >"$RUNNER_TEMP/compose-launch.log" 2>&1
+
+            - name: Set up Python
+              uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+              with:
+                  python-version: ${{ env.PYTHON_VERSION }}
+
+            - name: Install uv
+              uses: ./.github/actions/setup-uv
+              with:
+                  save-cache: 'false'
+
+            - name: Install SAML dependencies
+              run: sudo apt-get update && sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl
+
+            - name: Install sqlx-cli
+              uses: ./.github/actions/setup-sqlx-cli
+
+            - name: Install Python dependencies from the ref's lockfile
+              run: UV_PROJECT_ENVIRONMENT=$pythonLocation timeout --kill-after=10s "$PY_DEPS_SYNC_TIMEOUT" uv sync --frozen --dev
+
+            - name: Add service hostnames to /etc/hosts
+              run: echo "127.0.0.1 db redis7 kafka clickhouse clickhouse-coordinator objectstorage temporal" | sudo tee -a /etc/hosts
+
+            - name: Set up needed files
+              run: |
+                  mkdir -p frontend/dist
+                  touch frontend/dist/index.html frontend/dist/layout.html frontend/dist/exporter.html
+                  ./bin/download-mmdb
+
+            - name: Wait for services
+              env:
+                  COMPOSE_FILE: docker-compose.dev.yml:docker-compose.profiles.yml
+              run: |
+                  bin/ci-wait-for-docker wait objectstorage \
+                    || { echo "::group::compose launch log"; cat "$RUNNER_TEMP/compose-launch.log" || true; echo "::endgroup::"; exit 1; }
+
+            - name: Migrate test_posthog from scratch
+              # As PostHog's CI does: the full migration chain runs in its own process, then pytest adopts the database.
+              env:
+                  DATABASE_URL: postgres://posthog:posthog@localhost:5432/test_posthog
+              run: |
+                  docker compose -f docker-compose.dev.yml exec -T db psql -U posthog postgres \
+                    -c "DROP DATABASE IF EXISTS test_posthog;" -c "CREATE DATABASE test_posthog;"
+                  python manage.py migrate
+
+            - name: No missing or conflicting migrations
+              env:
+                  DATABASE_URL: postgres://posthog:posthog@localhost:5432/test_posthog
+              run: python manage.py makemigrations --check --dry-run
+
+            - name: Cohort, task and personhog fake-client suites
+              if: ${{ !cancelled() }}
+              run: >-
+                  pytest -p no:cacheprovider --reuse-db -q --junitxml=junit-cohort-suites.xml
+                  products/cohorts/backend/ posthog/test/test_cohort_model.py
+                  posthog/tasks/test/test_calculate_cohort.py posthog/personhog_client/test_fake_client.py
+
+            - name: Cohort API suite
+              if: ${{ !cancelled() }}
+              run: pytest -p no:cacheprovider --reuse-db -q --junitxml=junit-api-cohort.xml posthog/api/test/test_cohort.py
+
+            - name: Suites for files upstream also changed (resource-transfer snapshot, flags cache)
+              if: ${{ !cancelled() }}
+              run: >-
+                  pytest -p no:cacheprovider --reuse-db -q --junitxml=junit-overlap.xml
+                  posthog/models/resource_transfer/test/test_visitor_field_snapshots.py
+                  products/feature_flags/backend/test/test_flags_cache.py
+
+            - name: Upload test reports
+              if: ${{ always() }}
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: test-reports-${{ github.run_id }}
+                  path: junit-*.xml
+                  if-no-files-found: ignore

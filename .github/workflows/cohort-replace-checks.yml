@@ -91,7 +91,13 @@ jobs:
                   save-cache: 'false'
 
             - name: Install SAML dependencies
-              run: sudo apt-get update && sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl
+              # PostHog's CI retries this step (Depot's retry:); GitHub Actions has no step retry, so loop.
+              run: |
+                  for attempt in 1 2 3; do
+                      sudo apt-get update && sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl && exit 0
+                      echo "apt attempt $attempt failed"; sleep 30
+                  done
+                  exit 1
 
             - name: Install Python dependencies from the ref's lockfile
               run: UV_PROJECT_ENVIRONMENT=$pythonLocation timeout --kill-after=10s "$PY_DEPS_SYNC_TIMEOUT" uv sync --frozen --dev
@@ -169,7 +175,13 @@ jobs:
                   save-cache: 'false'
 
             - name: Install SAML dependencies
-              run: sudo apt-get update && sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl
+              # PostHog's CI retries this step (Depot's retry:); GitHub Actions has no step retry, so loop.
+              run: |
+                  for attempt in 1 2 3; do
+                      sudo apt-get update && sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl && exit 0
+                      echo "apt attempt $attempt failed"; sleep 30
+                  done
+                  exit 1
 
             - name: Install sqlx-cli
               uses: ./.github/actions/setup-sqlx-cli
@@ -267,7 +279,13 @@ jobs:
                   save-cache: 'false'
 
             - name: Install SAML dependencies
-              run: sudo apt-get update && sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl
+              # PostHog's CI retries this step (Depot's retry:); GitHub Actions has no step retry, so loop.
+              run: |
+                  for attempt in 1 2 3; do
+                      sudo apt-get update && sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl && exit 0
+                      echo "apt attempt $attempt failed"; sleep 30
+                  done
+                  exit 1
 
             - name: Install Python dependencies from the ref's lockfile
               run: UV_PROJECT_ENVIRONMENT=$pythonLocation timeout --kill-after=10s "$PY_DEPS_SYNC_TIMEOUT" uv sync --frozen --dev
@@ -276,6 +294,7 @@ jobs:
             # check-openapi-types' install and ci-mcp's: the frontend and MCP generators, and the product packages
             # the MCP build and unit tests import.
             - name: Install pnpm, Node and the pnpm dependencies
+              id: pnpm
               uses: ./.github/actions/pnpm-install
               with:
                   install-command: pnpm --filter=@posthog/root --filter=@posthog/frontend... --filter=@posthog/mcp... --filter='./products/*' install --frozen-lockfile
@@ -327,33 +346,33 @@ jobs:
 
             # The MCP checks run on the committed files, not the regenerated ones.
             - name: Reset the tree before the MCP checks
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
               run: |
                   git reset -q
                   git checkout -- .
                   git clean -fdq -- services/mcp products frontend/src
 
             - name: Lint MCP tool names
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
               run: cd services/mcp && pnpm lint-tool-names
 
             # As ci-mcp's unit-tests job: the workers-pool project needs public/ (from pnpm build) and
             # shared/guidelines.md (from copy-instructions) on disk.
             - name: Build the MCP package
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
               working-directory: services/mcp
               run: |
                   pnpm build
                   pnpm exec tsx scripts/copy-instructions.ts
 
             - name: Type check (tsgo)
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
               run: cd services/mcp && pnpm typecheck
 
             # The whole unit suite, as ci-mcp runs it. Its tool-definition, schema-snapshot and feature-flag tests
             # read every products/*/mcp/tools.yaml, products/cohorts/mcp/tools.yaml included.
             - name: MCP unit tests, with no snapshot drift
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
               run: |
                   pnpm --filter=@posthog/mcp run test -u
                   if [ -n "$(git status --porcelain -- services/mcp/tests/unit)" ]; then
@@ -364,11 +383,11 @@ jobs:
                   fi
 
             - name: MCP Hono unit tests
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
               run: cd services/mcp && pnpm run test:hono
 
             - name: Where the replace tool appears in the committed MCP files
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
               run: git grep -c "cohorts-replace-static-members" -- services/mcp products/cohorts/mcp || true
 
     benchmark:
@@ -437,7 +456,11 @@ jobs:
               env:
                   OPENSSL_NO_VENDOR: '1'
               run: |
-                  sudo apt-get install -y libssl-dev pkg-config
+                  for attempt in 1 2 3; do
+                      sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config && break
+                      [ "$attempt" -lt 3 ] || exit 1
+                      echo "apt attempt $attempt failed"; sleep 30
+                  done
                   cargo build -p personhog-replica -p personhog-router --locked --release
                   ls -la "$CARGO_TARGET_DIR/release/personhog-replica" "$CARGO_TARGET_DIR/release/personhog-router"
                   df -h /
@@ -453,7 +476,12 @@ jobs:
                   save-cache: 'false'
 
             - name: Install SAML dependencies
-              run: sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl
+              run: |
+                  for attempt in 1 2 3; do
+                      sudo apt-get update && sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl && exit 0
+                      echo "apt attempt $attempt failed"; sleep 30
+                  done
+                  exit 1
 
             - name: Install sqlx-cli
               uses: ./.github/actions/setup-sqlx-cli
@@ -481,6 +509,7 @@ jobs:
             # ClickHouse (into CLICKHOUSE_DATABASE) and the persons database through sqlx. Then the no-op async
             # migrations, as the runbook's dev-migrate.sh does.
             - name: Migrate the dev stack
+              id: migrate
               run: |
                   bin/migrate
                   python manage.py run_async_migrations --complete-noop-migrations
@@ -496,7 +525,7 @@ jobs:
                   python -c 'import json,sys; print(json.dumps([json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")], indent=2))' results_smoke.out > results_smoke.json
 
             - name: Memory cells
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && steps.migrate.outcome == 'success' }}
               env:
                   VIRTUAL_ENV: ${{ env.pythonLocation }}
               run: |
@@ -505,7 +534,7 @@ jobs:
 
             # Each cell in its own subprocess, the way the harness's matrix and repeats modes run them.
             - name: The two 1M replace cells
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && steps.migrate.outcome == 'success' }}
               env:
                   VIRTUAL_ENV: ${{ env.pythonLocation }}
               run: |
@@ -523,7 +552,7 @@ jobs:
                   PY
 
             - name: Summary, and fail on any cell that errored or broke a check
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && steps.migrate.outcome == 'success' }}
               run: |
                   cat bench-commits.txt
                   python - <<'PY'

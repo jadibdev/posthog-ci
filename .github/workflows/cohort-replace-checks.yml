@@ -6,8 +6,13 @@
 # through bin/ci-wait-for-docker, Python 3.14.7 with `uv sync --frozen --dev`, the service hostnames in /etc/hosts,
 # sqlx-cli for the persons database, and an out-of-process migrate before `pytest --reuse-db`.
 #
+# The node job follows PostHog's check-openapi-types job (.depot/workflows/ci-backend.yml) and the build and unit-tests
+# jobs of .github/workflows/ci-mcp.yml. The benchmark job follows the release build in .github/workflows/ci-rust.yml
+# and the benchmark branch's own README.
+#
 # Trigger: Actions tab, "Cohort replace checks", Run workflow. Or:
 #   gh workflow run cohort-replace-checks.yml -R <repo holding this file> -f ref=<branch or sha> -f commits=10
+#   ... -f tests=false -f node=false -f benchmark=true   # the benchmark alone
 name: Cohort replace checks
 
 on:
@@ -24,6 +29,18 @@ on:
                 description: Run the test suites (false runs only the lint job)
                 type: boolean
                 default: true
+            node:
+                description: Regenerate the OpenAPI and MCP outputs, fail on drift, and run the MCP tests
+                type: boolean
+                default: true
+            benchmark:
+                description: Build personhog in release mode and run the replace benchmark (about 1.5 hours)
+                type: boolean
+                default: false
+            benchmark_ref:
+                description: Branch or SHA of jadibdev/posthog that holds the benchmark harness
+                required: false
+                default: jadibdev/cohorts/static-cohort-replace-benchmark
 
 permissions:
     contents: read
@@ -215,3 +232,344 @@ jobs:
                   name: test-reports-${{ github.run_id }}
                   path: junit-*.xml
                   if-no-files-found: ignore
+
+    node:
+        name: OpenAPI and MCP codegen drift, MCP tests
+        if: ${{ inputs.node }}
+        runs-on: ubuntu-24.04
+        timeout-minutes: 60
+        steps:
+            - name: Free disk space for the service images and node_modules
+              run: |
+                  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+                  df -h /
+
+            - name: Check out the ref
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  repository: ${{ env.SOURCE_REPO }}
+                  ref: ${{ inputs.ref }}
+
+            # As check-openapi-types: drf-spectacular boots Django, which needs Postgres and ClickHouse up.
+            - name: Start services
+              env:
+                  COMPOSE_FILE: docker-compose.dev.yml:docker-compose.profiles.yml
+              run: nohup bin/ci-wait-for-docker launch --background --down db clickhouse </dev/null >"$RUNNER_TEMP/compose-launch.log" 2>&1
+
+            - name: Set up Python
+              uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+              with:
+                  python-version: ${{ env.PYTHON_VERSION }}
+
+            - name: Install uv
+              uses: ./.github/actions/setup-uv
+              with:
+                  save-cache: 'false'
+
+            - name: Install SAML dependencies
+              run: sudo apt-get update && sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl
+
+            - name: Install Python dependencies from the ref's lockfile
+              run: UV_PROJECT_ENVIRONMENT=$pythonLocation timeout --kill-after=10s "$PY_DEPS_SYNC_TIMEOUT" uv sync --frozen --dev
+
+            # pnpm and Node from the ref's .nvmrc, through PostHog's own composite action. The filter is the union of
+            # check-openapi-types' install and ci-mcp's: the frontend and MCP generators, and the product packages
+            # the MCP build and unit tests import.
+            - name: Install pnpm, Node and the pnpm dependencies
+              uses: ./.github/actions/pnpm-install
+              with:
+                  install-command: pnpm --filter=@posthog/root --filter=@posthog/frontend... --filter=@posthog/mcp... --filter='./products/*' install --frozen-lockfile
+
+            - name: Install desktop API client generator
+              working-directory: products/desktop
+              run: |
+                  if [ ! -f ../../bin/build-desktop-api-client.sh ]; then
+                      echo "This ref predates the desktop API client regen, so there is nothing to install."
+                      exit 0
+                  fi
+                  pnpm install --frozen-lockfile --filter @posthog/api-client --ignore-scripts --config.node-linker=isolated
+
+            - name: Wait for services
+              env:
+                  COMPOSE_FILE: docker-compose.dev.yml:docker-compose.profiles.yml
+              run: |
+                  bin/ci-wait-for-docker wait --only db clickhouse \
+                    || { echo "::group::compose launch log"; cat "$RUNNER_TEMP/compose-launch.log" || true; echo "::endgroup::"; exit 1; }
+
+            - name: Regenerate the OpenAPI outputs and the MCP tool YAML and handlers
+              # check-openapi-types' own sequence.
+              run: |
+                  ./bin/hogli build:openapi
+                  pnpm --filter=@posthog/mcp run scaffold-yaml -- --sync-all
+
+            - name: Regenerate the MCP tool-inputs schema
+              # ci-mcp's "Check MCP schema is up to date" generator (hogli build:schema-mcp).
+              run: (cd services/mcp && pnpm exec tsx scripts/generate-tool-schema.ts && pnpm exec oxfmt schema/tool-inputs.json)
+
+            - name: Generated files match what is committed
+              run: |
+                  git add -N .
+                  if git diff --exit-code --stat; then
+                      echo "The OpenAPI and MCP outputs are up to date."
+                      exit 0
+                  fi
+                  git diff --binary > "$RUNNER_TEMP/codegen-drift.patch"
+                  echo "::error::Generated files differ from the commit: $(git diff --name-only | tr '\n' ' ')"
+                  exit 1
+
+            - name: Upload the drift patch
+              if: ${{ failure() }}
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: codegen-drift-${{ github.run_id }}
+                  path: ${{ runner.temp }}/codegen-drift.patch
+                  if-no-files-found: ignore
+
+            # The MCP checks run on the committed files, not the regenerated ones.
+            - name: Reset the tree before the MCP checks
+              if: ${{ !cancelled() }}
+              run: |
+                  git reset -q
+                  git checkout -- .
+                  git clean -fdq -- services/mcp products frontend/src
+
+            - name: Lint MCP tool names
+              if: ${{ !cancelled() }}
+              run: cd services/mcp && pnpm lint-tool-names
+
+            # As ci-mcp's unit-tests job: the workers-pool project needs public/ (from pnpm build) and
+            # shared/guidelines.md (from copy-instructions) on disk.
+            - name: Build the MCP package
+              if: ${{ !cancelled() }}
+              working-directory: services/mcp
+              run: |
+                  pnpm build
+                  pnpm exec tsx scripts/copy-instructions.ts
+
+            - name: Type check (tsgo)
+              if: ${{ !cancelled() }}
+              run: cd services/mcp && pnpm typecheck
+
+            # The whole unit suite, as ci-mcp runs it. Its tool-definition, schema-snapshot and feature-flag tests
+            # read every products/*/mcp/tools.yaml, products/cohorts/mcp/tools.yaml included.
+            - name: MCP unit tests, with no snapshot drift
+              if: ${{ !cancelled() }}
+              run: |
+                  pnpm --filter=@posthog/mcp run test -u
+                  if [ -n "$(git status --porcelain -- services/mcp/tests/unit)" ]; then
+                      git status --short -- services/mcp/tests/unit
+                      git diff -- services/mcp/tests/unit
+                      echo "::error::MCP unit test snapshots are out of date."
+                      exit 1
+                  fi
+
+            - name: MCP Hono unit tests
+              if: ${{ !cancelled() }}
+              run: cd services/mcp && pnpm run test:hono
+
+            - name: Where the replace tool appears in the committed MCP files
+              if: ${{ !cancelled() }}
+              run: git grep -c "cohorts-replace-static-members" -- services/mcp products/cohorts/mcp || true
+
+    benchmark:
+        name: Replace benchmark (release personhog)
+        if: ${{ inputs.benchmark }}
+        runs-on: ubuntu-24.04
+        timeout-minutes: 300
+        env:
+            # The benchmark runs against the dev stack, not the test databases, as the benchmark README says.
+            TEST: '0'
+            DEBUG: '1'
+            CLICKHOUSE_DATABASE: default
+            CARGO_TARGET_DIR: /tmp/cargo-target
+            BENCH_DIR: products/cohorts/backend/benchmarks
+        steps:
+            - name: Free disk space for the service images and the Rust build
+              run: |
+                  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+                  df -h /
+
+            - name: Check out the ref
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  repository: ${{ env.SOURCE_REPO }}
+                  ref: ${{ inputs.ref }}
+
+            - name: Check out the benchmark harness
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  repository: ${{ env.SOURCE_REPO }}
+                  ref: ${{ inputs.benchmark_ref }}
+                  path: bench-src
+                  sparse-checkout: products/cohorts/backend/benchmarks
+
+            # The ref's code, measured by the harness: the same as running it from a worktree with the harness copied in.
+            - name: Put the harness into the ref's checkout
+              run: |
+                  mkdir -p "$BENCH_DIR"
+                  for f in replace_benchmark.py run_bench.sh summarize.py; do cp "bench-src/$BENCH_DIR/$f" "$BENCH_DIR/"; done
+                  chmod +x "$BENCH_DIR/run_bench.sh"
+                  {
+                      echo "ref:     $(git rev-parse HEAD) $(git log -1 --format=%s)"
+                      echo "harness: $(git -C bench-src rev-parse HEAD) $(git -C bench-src log -1 --format=%s)"
+                  } | tee bench-commits.txt
+                  rm -rf bench-src
+
+            - name: Start services
+              env:
+                  COMPOSE_FILE: docker-compose.dev.yml:docker-compose.profiles.yml
+              run: |
+                  cp posthog/user_scripts/latest_user_defined_function.xml docker/clickhouse/user_defined_function.xml
+                  nohup bin/ci-wait-for-docker launch --background --down \
+                    db redis7 clickhouse zookeeper kafka objectstorage </dev/null >"$RUNNER_TEMP/compose-launch.log" 2>&1
+
+            # As ci-rust's release build: protoc, the pinned toolchain, system OpenSSL, --locked.
+            - name: Install protoc
+              uses: ./.github/actions/setup-protoc
+
+            - name: Install Rust
+              uses: ./.github/actions/setup-rust
+              with:
+                  toolchain: 1.91.1
+
+            - name: Build personhog-replica and personhog-router (release)
+              working-directory: rust
+              env:
+                  OPENSSL_NO_VENDOR: '1'
+              run: |
+                  sudo apt-get install -y libssl-dev pkg-config
+                  cargo build -p personhog-replica -p personhog-router --locked --release
+                  ls -la "$CARGO_TARGET_DIR/release/personhog-replica" "$CARGO_TARGET_DIR/release/personhog-router"
+                  df -h /
+
+            - name: Set up Python
+              uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+              with:
+                  python-version: ${{ env.PYTHON_VERSION }}
+
+            - name: Install uv
+              uses: ./.github/actions/setup-uv
+              with:
+                  save-cache: 'false'
+
+            - name: Install SAML dependencies
+              run: sudo apt-get install -y libxml2-dev libxmlsec1-dev libxmlsec1-openssl
+
+            - name: Install sqlx-cli
+              uses: ./.github/actions/setup-sqlx-cli
+
+            - name: Install Python dependencies from the ref's lockfile
+              run: UV_PROJECT_ENVIRONMENT=$pythonLocation timeout --kill-after=10s "$PY_DEPS_SYNC_TIMEOUT" uv sync --frozen --dev
+
+            - name: Add service hostnames to /etc/hosts
+              run: echo "127.0.0.1 db redis7 kafka clickhouse clickhouse-coordinator objectstorage temporal" | sudo tee -a /etc/hosts
+
+            - name: Set up needed files
+              run: |
+                  mkdir -p frontend/dist
+                  touch frontend/dist/index.html frontend/dist/layout.html frontend/dist/exporter.html
+                  ./bin/download-mmdb
+
+            - name: Wait for services
+              env:
+                  COMPOSE_FILE: docker-compose.dev.yml:docker-compose.profiles.yml
+              run: |
+                  bin/ci-wait-for-docker wait objectstorage \
+                    || { echo "::group::compose launch log"; cat "$RUNNER_TEMP/compose-launch.log" || true; echo "::endgroup::"; exit 1; }
+
+            # The README's "migrated with bin/hogli migrations:run", which runs bin/migrate with DEBUG=1: Postgres,
+            # ClickHouse (into CLICKHOUSE_DATABASE) and the persons database through sqlx. Then the no-op async
+            # migrations, as the runbook's dev-migrate.sh does.
+            - name: Migrate the dev stack
+              run: |
+                  bin/migrate
+                  python manage.py run_async_migrations --complete-noop-migrations
+
+            # run_bench.sh uses the active environment when VIRTUAL_ENV is set. The dependencies live in the runner's
+            # Python, so it points there. The binaries are read from /tmp/cargo-target/release, where the build put them.
+            - name: Smoke cells
+              env:
+                  VIRTUAL_ENV: ${{ env.pythonLocation }}
+              run: |
+                  set -o pipefail
+                  "$BENCH_DIR/run_bench.sh" smoke | tee results_smoke.out
+                  python -c 'import json,sys; print(json.dumps([json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")], indent=2))' results_smoke.out > results_smoke.json
+
+            - name: Memory cells
+              if: ${{ !cancelled() }}
+              env:
+                  VIRTUAL_ENV: ${{ env.pythonLocation }}
+              run: |
+                  "$BENCH_DIR/run_bench.sh" memory
+                  cp "$BENCH_DIR/results_memory.json" results_memory.json
+
+            # Each cell in its own subprocess, the way the harness's matrix and repeats modes run them.
+            - name: The two 1M replace cells
+              if: ${{ !cancelled() }}
+              env:
+                  VIRTUAL_ENV: ${{ env.pythonLocation }}
+              run: |
+                  python - <<'PY'
+                  import json, os, sys
+                  sys.path.insert(0, os.environ["BENCH_DIR"])
+                  sys.argv = ["replace_benchmark.py"]
+                  import replace_benchmark as bench
+                  results = []
+                  for churn in ("0.0", "1.0"):
+                      print(f"running replace 1000000 {churn}", flush=True)
+                      results.append(bench._run_cell_subprocess(["replace", "1000000", churn]))
+                      with open("results_1m.json", "w") as f:
+                          json.dump(results, f, indent=2)
+                  PY
+
+            - name: Summary, and fail on any cell that errored or broke a check
+              if: ${{ !cancelled() }}
+              run: |
+                  cat bench-commits.txt
+                  python - <<'PY'
+                  import json, os, pathlib, subprocess
+                  bad, total = [], 0
+                  for name in ("results_smoke.json", "results_memory.json", "results_1m.json"):
+                      path = pathlib.Path(name)
+                      if not path.exists():
+                          bad.append({"file": name, "error": "missing"})
+                          continue
+                      print(f"== {name}", flush=True)
+                      subprocess.run(["python", f"{os.environ['BENCH_DIR']}/summarize.py", name], check=False)
+                      for cell in json.loads(path.read_text()):
+                          total += 1
+                          if "error" in cell:
+                              ok = False
+                          elif cell["kind"] == "removal":
+                              ok = cell["removed_all"]
+                          else:
+                              ok = (
+                                  cell["postgres_exact"]
+                                  and cell["clickhouse_exact_after_seconds"] is not None
+                                  and cell["clickhouse_mutations"] == 1
+                                  and not cell["run_failed"]
+                                  and cell["fields_cleared"]
+                                  and not cell["is_calculating"]
+                              )
+                          if not ok:
+                              bad.append(cell)
+                  print(f"{total} cells, {len(bad)} with an error or a failed check")
+                  for cell in bad:
+                      print(json.dumps(cell)[:2000])
+                  raise SystemExit(1 if bad else 0)
+                  PY
+
+            - name: Upload results and logs
+              if: ${{ always() }}
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: benchmark-results-${{ github.run_id }}
+                  path: |
+                      bench-commits.txt
+                      results_smoke.json
+                      results_smoke.out
+                      results_memory.json
+                      results_1m.json
+                      /tmp/ph-replica.log
+                      /tmp/ph-router.log
+                  if-no-files-found: warn

@@ -542,12 +542,18 @@ jobs:
                   "$BENCH_DIR/run_bench.sh" memory
                   cp "$BENCH_DIR/results_memory.json" results_memory.json
 
-            # Each cell in its own subprocess, the way the harness's matrix and repeats modes run them.
+            # Each cell in its own subprocess, the way the harness's matrix and repeats modes run them. The harness is
+            # called directly here, so this step sets the environment run_bench.sh exports. The replica and router it
+            # started in the earlier steps keep running for the rest of the job.
             - name: The two 1M replace cells
               if: ${{ !cancelled() && steps.migrate.outcome == 'success' }}
               env:
                   VIRTUAL_ENV: ${{ env.pythonLocation }}
+                  PERSONHOG_ADDR: 127.0.0.1:50052
+                  PERSONHOG_TIMEOUT_MS: '60000'
+                  PERSONS_DATABASE_URL: postgres://posthog:posthog@localhost:5432/posthog_persons
               run: |
+                  (echo > /dev/tcp/127.0.0.1/50052) 2>/dev/null || { echo "::error::personhog router is not up"; exit 1; }
                   python - <<'PY'
                   import json, os, sys
                   sys.path.insert(0, os.environ["BENCH_DIR"])

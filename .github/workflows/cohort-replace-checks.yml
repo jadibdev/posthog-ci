@@ -505,6 +505,16 @@ jobs:
                   bin/ci-wait-for-docker wait objectstorage \
                     || { echo "::group::compose launch log"; cat "$RUNNER_TEMP/compose-launch.log" || true; echo "::endgroup::"; exit 1; }
 
+            # bin/migrate ends with setup_tasks_oauth, which signs with RS256 and needs a key. Settings generate one only
+            # under TEST; ci-mcp passes a fake key from a repo variable. This job makes a throwaway one.
+            - name: Throwaway OIDC signing key
+              run: |
+                  {
+                      echo "OIDC_RSA_PRIVATE_KEY<<EOF_OIDC_KEY"
+                      openssl genrsa 2048 2>/dev/null
+                      echo "EOF_OIDC_KEY"
+                  } >> "$GITHUB_ENV"
+
             # The README's "migrated with bin/hogli migrations:run", which runs bin/migrate with DEBUG=1: Postgres,
             # ClickHouse (into CLICKHOUSE_DATABASE) and the persons database through sqlx. Then the no-op async
             # migrations, as the runbook's dev-migrate.sh does.

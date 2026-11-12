@@ -29,6 +29,14 @@ on:
                 description: Run the test suites (false runs only the lint job)
                 type: boolean
                 default: true
+            broad:
+                description: With tests, run the broad backend suites (API, tasks, models, cohorts, feature flags) in parallel jobs instead of the targeted ones
+                type: boolean
+                default: false
+            rust:
+                description: Run the personhog-replica and personhog-router Rust tests against a migrated persons database
+                type: boolean
+                default: false
             node:
                 description: Regenerate the OpenAPI and MCP outputs, fail on drift, and run the MCP tests
                 type: boolean
@@ -139,10 +147,28 @@ jobs:
                       posthog/tasks/test/test_calculate_cohort.py posthog/api/test/test_cohort.py
 
     tests:
-        name: Migrations and test suites
+        name: Migrations and test suites (${{ matrix.group }})
         if: ${{ inputs.tests }}
         runs-on: ubuntu-24.04
-        timeout-minutes: 150
+        timeout-minutes: ${{ matrix.group == 'targeted' && 150 || 350 }}
+        strategy:
+            fail-fast: false
+            # Targeted: the cohort replace suites only. Broad: the directories the change can reach, run serially in each
+            # job (-n 4 ran out of memory in a 16 GB codespace), split by test count with the ref's pytest-split.
+            # The broad groups are a superset of the targeted suites.
+            matrix:
+                include: >-
+                    ${{ fromJSON(inputs.broad && '[
+                    {"group":"api-1","split":"--splits 4 --group 1","paths":"posthog/api/test"},
+                    {"group":"api-2","split":"--splits 4 --group 2","paths":"posthog/api/test"},
+                    {"group":"api-3","split":"--splits 4 --group 3","paths":"posthog/api/test"},
+                    {"group":"api-4","split":"--splits 4 --group 4","paths":"posthog/api/test"},
+                    {"group":"tasks","split":"","paths":"posthog/tasks/test posthog/test/test_cohort_model.py posthog/personhog_client/test_fake_client.py"},
+                    {"group":"models-1","split":"--splits 2 --group 1","paths":"posthog/models"},
+                    {"group":"models-2","split":"--splits 2 --group 2","paths":"posthog/models"},
+                    {"group":"products-1","split":"--splits 2 --group 1","paths":"products/cohorts products/feature_flags"},
+                    {"group":"products-2","split":"--splits 2 --group 2","paths":"products/cohorts products/feature_flags"}
+                    ]' || '[{"group":"targeted"}]') }}
         steps:
             - name: Free disk space for the service images
               # A hosted runner starts with about 14 GB free; the service images and the Python environment need more.
@@ -220,30 +246,97 @@ jobs:
               run: python manage.py makemigrations --check --dry-run
 
             - name: Cohort, task and personhog fake-client suites
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && matrix.group == 'targeted' }}
               run: >-
                   pytest -p no:cacheprovider --reuse-db -q --junitxml=junit-cohort-suites.xml
                   products/cohorts/backend/ posthog/test/test_cohort_model.py
                   posthog/tasks/test/test_calculate_cohort.py posthog/personhog_client/test_fake_client.py
 
             - name: Cohort API suite
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && matrix.group == 'targeted' }}
               run: pytest -p no:cacheprovider --reuse-db -q --junitxml=junit-api-cohort.xml posthog/api/test/test_cohort.py
 
             - name: Suites for files upstream also changed (resource-transfer snapshot, flags cache)
-              if: ${{ !cancelled() }}
+              if: ${{ !cancelled() && matrix.group == 'targeted' }}
               run: >-
                   pytest -p no:cacheprovider --reuse-db -q --junitxml=junit-overlap.xml
                   posthog/models/resource_transfer/test/test_visitor_field_snapshots.py
                   products/feature_flags/backend/test/test_flags_cache.py
 
+            - name: Broad suite ${{ matrix.group }}
+              if: ${{ !cancelled() && matrix.group != 'targeted' }}
+              run: >-
+                  pytest -p no:cacheprovider --reuse-db -q --junitxml=junit-${{ matrix.group }}.xml
+                  ${{ matrix.split }} ${{ matrix.paths }}
+
             - name: Upload test reports
               if: ${{ always() }}
               uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
               with:
-                  name: test-reports-${{ github.run_id }}
+                  name: test-reports-${{ github.run_id }}-${{ matrix.group }}
                   path: junit-*.xml
                   if-no-files-found: ignore
+
+    rust:
+        name: personhog Rust tests
+        if: ${{ inputs.rust }}
+        runs-on: ubuntu-24.04
+        timeout-minutes: 90
+        defaults:
+            run:
+                working-directory: rust
+        env:
+            # The query macros check against the committed .sqlx data, as a fresh checkout has no schema at build time.
+            SQLX_OFFLINE: 'true'
+            DATABASE_URL: postgres://posthog:posthog@localhost:5432/posthog_persons
+        steps:
+            - name: Free disk space for the Rust build
+              working-directory: .
+              run: |
+                  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+                  df -h /
+
+            - name: Check out the ref
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  repository: ${{ env.SOURCE_REPO }}
+                  ref: ${{ inputs.ref }}
+
+            # As ci-rust's personhog job: Postgres only, then the persons database created and migrated with sqlx.
+            - name: Start Postgres
+              env:
+                  COMPOSE_FILE: ../docker-compose.dev.yml:../docker-compose.profiles.yml
+              run: |
+                  ../bin/ci-wait-for-docker launch --down db
+                  ../bin/ci-wait-for-docker wait --only db
+                  echo "127.0.0.1 db" | sudo tee -a /etc/hosts
+
+            - name: Install Rust
+              uses: ./.github/actions/setup-rust
+              with:
+                  toolchain: 1.91.1
+
+            - name: Install protoc
+              uses: ./.github/actions/setup-protoc
+
+            - name: Install sqlx-cli
+              uses: ./.github/actions/setup-sqlx-cli
+
+            - name: Create and migrate the persons database
+              run: |
+                  sqlx database create
+                  sqlx migrate run --source persons_migrations/
+
+            - name: Test personhog-replica and personhog-router
+              env:
+                  OPENSSL_NO_VENDOR: '1'
+              run: |
+                  for attempt in 1 2 3; do
+                      sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config && break
+                      [ "$attempt" -lt 3 ] || exit 1
+                      echo "apt attempt $attempt failed"; sleep 30
+                  done
+                  cargo test -p personhog-replica -p personhog-router --locked
 
     node:
         name: OpenAPI and MCP codegen drift, MCP tests

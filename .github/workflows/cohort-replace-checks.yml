@@ -53,6 +53,10 @@ on:
                 description: Branch or SHA of jadibdev/posthog that holds the benchmark harness
                 required: false
                 default: jadibdev/cohorts/static-cohort-replace-benchmark
+            bench_cells:
+                description: Optional single benchmark cell to run instead of memory and the 1M pair (e.g. replace:10000000:0.0)
+                required: false
+                default: ''
 
 permissions:
     contents: read
@@ -633,6 +637,10 @@ jobs:
 
             # The ref's code, measured by the harness: the same as running it from a worktree with the harness copied in.
             - name: Put the harness into the ref's checkout
+              env:
+                  INPUT_REF: ${{ inputs.ref }}
+                  INPUT_BENCHMARK_REF: ${{ inputs.benchmark_ref }}
+                  INPUT_BENCH_CELLS: ${{ inputs.bench_cells }}
               run: |
                   mkdir -p "$BENCH_DIR"
                   for f in replace_benchmark.py run_bench.sh summarize.py; do cp "bench-src/$BENCH_DIR/$f" "$BENCH_DIR/"; done
@@ -641,6 +649,17 @@ jobs:
                       echo "ref:     $(git rev-parse HEAD) $(git log -1 --format=%s)"
                       echo "harness: $(git -C bench-src rev-parse HEAD) $(git -C bench-src log -1 --format=%s)"
                   } | tee bench-commits.txt
+                  {
+                      echo "input_ref:           $INPUT_REF"
+                      echo "input_benchmark_ref: $INPUT_BENCHMARK_REF"
+                      echo "input_bench_cells:   $INPUT_BENCH_CELLS"
+                      echo "resolved_ref:        $(git rev-parse HEAD) $(git log -1 --format=%s)"
+                      echo "resolved_harness:    $(git -C bench-src rev-parse HEAD) $(git -C bench-src log -1 --format=%s)"
+                      echo "uname:               $(uname -srm)"
+                      echo "nproc:               $(nproc)"
+                      lscpu | grep -E 'Architecture|CPU\(s\)|Model name|Thread|Core|Socket' || true
+                      free -h
+                  } | tee runner-info.txt
                   rm -rf bench-src
 
             - name: Start services
@@ -736,6 +755,7 @@ jobs:
             # run_bench.sh uses the active environment when VIRTUAL_ENV is set. The dependencies live in the runner's
             # Python, so it points there. The binaries are read from /tmp/cargo-target/release, where the build put them.
             - name: Smoke cells
+              id: smoke
               env:
                   VIRTUAL_ENV: ${{ env.pythonLocation }}
               run: |
@@ -744,7 +764,7 @@ jobs:
                   python -c 'import json,sys; print(json.dumps([json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")], indent=2))' results_smoke.out > results_smoke.json
 
             - name: Memory cells
-              if: ${{ !cancelled() && steps.migrate.outcome == 'success' }}
+              if: ${{ !cancelled() && steps.migrate.outcome == 'success' && inputs.bench_cells == '' }}
               env:
                   VIRTUAL_ENV: ${{ env.pythonLocation }}
               run: |
@@ -755,7 +775,7 @@ jobs:
             # called directly here, so this step sets the environment run_bench.sh exports. The replica and router it
             # started in the earlier steps keep running for the rest of the job.
             - name: The two 1M replace cells
-              if: ${{ !cancelled() && steps.migrate.outcome == 'success' }}
+              if: ${{ !cancelled() && steps.migrate.outcome == 'success' && inputs.bench_cells == '' }}
               env:
                   VIRTUAL_ENV: ${{ env.pythonLocation }}
                   PERSONHOG_ADDR: 127.0.0.1:50052
@@ -776,14 +796,193 @@ jobs:
                           json.dump(results, f, indent=2)
                   PY
 
+            - name: Custom bench cell
+              if: ${{ !cancelled() && steps.migrate.outcome == 'success' && steps.smoke.outcome == 'success' && inputs.bench_cells != '' }}
+              env:
+                  BENCH_CELL: ${{ inputs.bench_cells }}
+                  DISK_LOG_FILE: disk_log.txt
+                  VIRTUAL_ENV: ${{ env.pythonLocation }}
+                  PERSONHOG_ADDR: 127.0.0.1:50052
+                  PERSONHOG_TIMEOUT_MS: '60000'
+                  PERSONS_DATABASE_URL: postgres://posthog:posthog@localhost:5432/posthog_persons
+              run: |
+                  (echo > /dev/tcp/127.0.0.1/50052) 2>/dev/null || { echo "::error::personhog router is not up"; exit 1; }
+
+                  cat <<'EOF' > "$RUNNER_TEMP/bench_disk_log.sh"
+                  #!/usr/bin/env bash
+                  set -u
+                  label="${1:-snapshot}"
+                  log_file="${DISK_LOG_FILE:-disk_log.txt}"
+                  {
+                      echo "=== DISK SNAPSHOT: ${label} ($(date -u '+%Y-%m-%dT%H:%M:%SZ')) ==="
+                      echo "-- df -h / --"
+                      df -h /
+                      echo "-- docker system df --"
+                      docker system df || true
+                      echo "-- postgres (posthog_persons) --"
+                      docker compose -f docker-compose.dev.yml exec -T db psql -U posthog -d posthog_persons -c "
+                          SELECT
+                              relname,
+                              pg_total_relation_size(oid) AS total_bytes,
+                              pg_size_pretty(pg_total_relation_size(oid)) AS total_pretty,
+                              pg_size_pretty(pg_relation_size(oid)) AS table_pretty,
+                              pg_size_pretty(pg_indexes_size(oid)) AS indexes_pretty
+                          FROM pg_class
+                          WHERE relname IN ('posthog_person', 'posthog_cohortpeople')
+                            AND relnamespace = 'public'::regnamespace
+                          ORDER BY relname;
+                      " || true
+                      echo "-- clickhouse (${CLICKHOUSE_DATABASE:-default}) --"
+                      curl -fsS "http://localhost:8123/?database=${CLICKHOUSE_DATABASE:-default}" --data-binary "
+                          SELECT
+                              table,
+                              sumIf(bytes_on_disk, active) AS active_bytes,
+                              formatReadableSize(sumIf(bytes_on_disk, active)) AS active_pretty,
+                              sum(bytes_on_disk) AS total_bytes_on_disk,
+                              formatReadableSize(sum(bytes_on_disk)) AS total_pretty,
+                              sumIf(rows, active) AS active_rows,
+                              countIf(active) AS active_parts,
+                              count() AS total_parts
+                          FROM system.parts
+                          WHERE database = '${CLICKHOUSE_DATABASE:-default}'
+                            AND table IN ('person', 'person_static_cohort')
+                          GROUP BY table
+                          ORDER BY table
+                          FORMAT PrettyCompactMonoBlock
+                      " || true
+                      echo ""
+                  } | tee -a "$log_file" >&2
+                  EOF
+                  chmod +x "$RUNNER_TEMP/bench_disk_log.sh"
+                  export DISK_LOG_SCRIPT="$RUNNER_TEMP/bench_disk_log.sh"
+
+                  python - <<'PY'
+                  import json, os, shutil, subprocess, sys, textwrap
+
+                  spec = os.environ["BENCH_CELL"].strip()
+                  parts = spec.split(":")
+                  if len(parts) != 3 or parts[0] not in ("replace", "removal"):
+                      print(
+                          f"::error::bench_cells must be one 'kind:size:arg' cell (e.g. replace:10000000:0.0); got {spec!r}",
+                          flush=True,
+                      )
+                      raise SystemExit(1)
+                  kind, size_str, arg = parts
+                  try:
+                      size = int(size_str)
+                      if size <= 0:
+                          raise ValueError("size must be positive")
+                      if kind == "replace":
+                          float(arg)
+                      elif arg not in ("per_person", "bulk"):
+                          raise ValueError("removal method must be per_person or bulk")
+                  except ValueError as exc:
+                      print(f"::error::invalid bench_cells {spec!r}: {exc}", flush=True)
+                      raise SystemExit(1)
+
+                  disk_log = os.environ["DISK_LOG_SCRIPT"]
+                  subprocess.run([disk_log, "before_seeding"], check=False)
+
+                  usage = shutil.disk_usage("/")
+                  free_gib = usage.free / (1024**3)
+                  free_gb = usage.free / (1000**3)
+                  print(f"Disk gate check on /: {free_gib:.2f} GiB ({free_gb:.2f} GB) free", flush=True)
+                  if free_gib < 20.0:
+                      print(
+                          f"::error::Free disk space on / is {free_gib:.2f} GiB ({free_gb:.2f} GB), "
+                          f"below the 20 GiB gate required before seeding {spec}.",
+                          flush=True,
+                      )
+                      raise SystemExit(1)
+
+                  child_code = textwrap.dedent(
+                      """\
+                      import json, os, subprocess, sys
+
+                      kind, size, arg = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+                      sys.path.insert(0, os.environ["BENCH_DIR"])
+                      sys.argv = ["replace_benchmark.py"]
+                      import replace_benchmark as bench
+
+                      bench._setup_django()
+                      disk_log = os.environ["DISK_LOG_SCRIPT"]
+
+                      if kind == "replace":
+                          orig_seed = bench._seed_clickhouse
+
+                          def _seed_and_log(*a, **kw):
+                              res = orig_seed(*a, **kw)
+                              subprocess.run([disk_log, "after_seeding"], check=False)
+                              return res
+
+                          bench._seed_clickhouse = _seed_and_log
+                      else:
+                          orig_seed = bench._seed_postgres
+
+                          def _seed_and_log(*a, **kw):
+                              res = orig_seed(*a, **kw)
+                              subprocess.run([disk_log, "after_seeding"], check=False)
+                              return res
+
+                          bench._seed_postgres = _seed_and_log
+
+                      orig_cleanup = bench._cleanup_postgres
+
+                      def _log_and_cleanup(*a, **kw):
+                          subprocess.run([disk_log, "after_replace"], check=False)
+                          return orig_cleanup(*a, **kw)
+
+                      bench._cleanup_postgres = _log_and_cleanup
+
+                      result = (
+                          bench.run_replace_cell(size, float(arg))
+                          if kind == "replace"
+                          else bench.run_removal_cell(size, arg)
+                      )
+                      print(json.dumps(result), flush=True)
+                      """
+                  )
+
+                  print(f"running {kind} {size_str} {arg}", flush=True)
+                  completed = subprocess.run(
+                      [sys.executable, "-c", child_code, kind, size_str, arg],
+                      stdout=subprocess.PIPE,
+                      text=True,
+                      env=os.environ,
+                  )
+                  subprocess.run([disk_log, "after_cleanup"], check=False)
+
+                  lines = [line for line in completed.stdout.splitlines() if line.startswith("{")]
+                  if completed.returncode != 0 or not lines:
+                      result = {
+                          "cell": [kind, size_str, arg],
+                          "returncode": completed.returncode,
+                          "error": (completed.stdout or "subprocess failed; see job stderr log")[-2000:],
+                      }
+                  else:
+                      result = json.loads(lines[-1])
+                  with open("results_bench.json", "w") as f:
+                      json.dump([result], f, indent=2)
+                  if "error" in result:
+                      raise SystemExit(1)
+                  PY
+
             - name: Summary, and fail on any cell that errored or broke a check
               if: ${{ !cancelled() && steps.migrate.outcome == 'success' }}
+              env:
+                  BENCH_CELLS: ${{ inputs.bench_cells }}
               run: |
                   cat bench-commits.txt
+                  if [ -f runner-info.txt ]; then cat runner-info.txt; fi
                   python - <<'PY'
                   import json, os, pathlib, subprocess
                   bad, total = [], 0
-                  for name in ("results_smoke.json", "results_memory.json", "results_1m.json"):
+                  names = (
+                      ("results_smoke.json", "results_bench.json")
+                      if os.environ.get("BENCH_CELLS", "").strip()
+                      else ("results_smoke.json", "results_memory.json", "results_1m.json")
+                  )
+                  for name in names:
                       path = pathlib.Path(name)
                       if not path.exists():
                           bad.append({"file": name, "error": "missing"})
@@ -820,10 +1019,13 @@ jobs:
                   name: benchmark-results-${{ github.run_id }}
                   path: |
                       bench-commits.txt
+                      runner-info.txt
+                      disk_log.txt
                       results_smoke.json
                       results_smoke.out
                       results_memory.json
                       results_1m.json
+                      results_bench.json
                       /tmp/ph-replica.log
                       /tmp/ph-router.log
-                  if-no-files-found: warn
+                  if-no-files-found: ignore

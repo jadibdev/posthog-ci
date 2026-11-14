@@ -41,6 +41,10 @@ on:
                 description: Regenerate the OpenAPI and MCP outputs, fail on drift, and run the MCP tests
                 type: boolean
                 default: true
+            proto:
+                description: Lint the protos, check them for breaking changes against the merge base with PostHog's master, regenerate the Python and Node personhog stubs and fail on drift, and run the personhog Node tests
+                type: boolean
+                default: false
             preflight:
                 description: Migrate the dev stack and run hogli ci:preflight --strict against PostHog's master, as the pre-push hook does
                 type: boolean
@@ -496,6 +500,161 @@ jobs:
             - name: Where the replace tool appears in the committed MCP files
               if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
               run: git grep -c "cohorts-replace-static-members" -- services/mcp products/cohorts/mcp || true
+
+    # PostHog's ci-proto.yml in one job: buf lint, buf breaking, and both stub generators with a drift check. The
+    # breaking check runs against the merge base with PostHog's master, not master's tip, so upstream's newer protos
+    # don't count as this ref's changes. Then the personhog Node tests, prepared as ci-nodejs prepares them.
+    proto:
+        name: Proto lint, breaking check, stub drift, personhog Node tests
+        if: ${{ inputs.proto }}
+        runs-on: ubuntu-24.04
+        timeout-minutes: 90
+        steps:
+            - name: Free disk space for node_modules and the Rust addons
+              run: |
+                  sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+                  df -h /
+
+            - name: Check out the ref
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  repository: ${{ env.SOURCE_REPO }}
+                  ref: ${{ inputs.ref }}
+
+            - name: Find the merge base with PostHog's master and extract its protos
+              run: |
+                  head=$(git rev-parse HEAD)
+                  git fetch --no-tags --shallow-since="30 days ago" "https://github.com/${SOURCE_REPO}.git" "$head"
+                  git fetch --no-tags --shallow-since="30 days ago" https://github.com/PostHog/posthog.git +master:refs/remotes/posthog/master
+                  base=$(git merge-base posthog/master HEAD)
+                  echo "HEAD:           $head"
+                  echo "PostHog master: $(git rev-parse posthog/master)"
+                  echo "merge base:     $base"
+                  mkdir -p "$RUNNER_TEMP/proto-baseline"
+                  git archive "$base" proto | tar -x -C "$RUNNER_TEMP/proto-baseline"
+                  echo "Proto files changed since the merge base:"
+                  git diff --stat "$base" HEAD -- proto/
+
+            - name: Install buf
+              uses: bufbuild/buf-action@fd21066df7214747548607aaa45548ba2b9bc1ff # v1.4.0
+              with:
+                  setup_only: true
+                  version: '1.50.0'
+
+            - name: Lint protos
+              run: buf lint proto/
+
+            - name: Check for breaking changes against the merge base
+              if: ${{ !cancelled() }}
+              run: buf breaking proto/ --against "$RUNNER_TEMP/proto-baseline/proto/"
+
+            - name: Set up Python
+              if: ${{ !cancelled() }}
+              uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+              with:
+                  python-version: ${{ env.PYTHON_VERSION }}
+
+            - name: Install uv
+              if: ${{ !cancelled() }}
+              uses: ./.github/actions/setup-uv
+              with:
+                  save-cache: 'false'
+
+            - name: Regenerate the Python proto stubs
+              # ci-proto's python-codegen job: the codegen tools from the lock, then the generator.
+              if: ${{ !cancelled() }}
+              run: |
+                  UV_PROJECT_ENVIRONMENT=$pythonLocation uv sync --frozen --no-install-project --only-group proto-codegen
+                  bash bin/generate_personhog_proto.sh
+
+            - name: Install pnpm, Node and the Node.js dependencies
+              id: pnpm
+              if: ${{ !cancelled() }}
+              uses: ./.github/actions/pnpm-install
+              with:
+                  install-command: pnpm --filter=@posthog/nodejs... install --frozen-lockfile
+
+            - name: Regenerate the Node proto stubs
+              # ci-proto's node-codegen job.
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
+              run: |
+                  pnpm --dir nodejs run generate:personhog-proto
+                  pnpm --dir nodejs run generate:ingestion-worker-proto
+
+            - name: Generated stubs match what is committed
+              if: ${{ !cancelled() }}
+              run: |
+                  git add -N .
+                  if git diff --exit-code --stat; then
+                      echo "The Python and Node proto stubs are up to date."
+                      exit 0
+                  fi
+                  git diff --binary > "$RUNNER_TEMP/proto-drift.patch"
+                  echo "::error::Generated stubs differ from the commit: $(git diff --name-only | tr '\n' ' ')"
+                  exit 1
+
+            - name: Upload the drift patch
+              if: ${{ failure() }}
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              with:
+                  name: proto-drift-${{ github.run_id }}
+                  path: ${{ runner.temp }}/proto-drift.patch
+                  if-no-files-found: ignore
+
+            # The tests run on the committed files, not the regenerated ones.
+            - name: Reset the tree before the Node tests
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
+              run: |
+                  git reset -q
+                  git checkout -- .
+
+            # ci-nodejs builds the workspace's Rust addons and TypeScript packages before any Jest run.
+            - name: Install Rust
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
+              uses: ./.github/actions/setup-rust
+              with:
+                  toolchain: 1.91.1
+
+            - name: Prepare the Node.js workspace
+              id: prepare
+              if: ${{ !cancelled() && steps.pnpm.outcome == 'success' }}
+              run: bin/turbo --filter=@posthog/nodejs prepare
+
+            # Type-checks all five test files the RPC commit edits, the postgres-parity one included, with everything
+            # they import. Jest's ts-jest runs with isolatedModules, so it transpiles without type-checking.
+            - name: Type-check the personhog Node test files
+              if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+              working-directory: nodejs
+              run: |
+                  cat > tsconfig.personhog-check.json <<'EOF'
+                  {
+                      "extends": "./tsconfig.json",
+                      "compilerOptions": { "noEmit": true },
+                      "include": [],
+                      "files": [
+                          "src/common/personhog/client.test.ts",
+                          "src/common/personhog/persons.test.ts",
+                          "src/common/personhog/personhog-group-repository.test.ts",
+                          "src/common/personhog/personhog-person-repository.test.ts",
+                          "src/common/personhog/personhog-postgres-parity.serial.test.ts"
+                      ]
+                  }
+                  EOF
+                  pnpm exec tsc -p tsconfig.personhog-check.json
+                  rm tsconfig.personhog-check.json
+
+            # The four unit test files. personhog-postgres-parity.serial.test.ts isn't run: upstream runs it in
+            # ci-nodejs's serial lane against the full dev stack, a Django-built test database and an isolated
+            # persons-parity database, which this job doesn't start. It is type-checked above.
+            - name: personhog Node unit tests
+              if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+              working-directory: nodejs
+              run: >-
+                  pnpm exec jest --config jest.config.js --forceExit
+                  src/common/personhog/client.test.ts
+                  src/common/personhog/persons.test.ts
+                  src/common/personhog/personhog-group-repository.test.ts
+                  src/common/personhog/personhog-person-repository.test.ts
 
     # The pre-push hook's `hogli ci:preflight --strict`, which a fork push can't run against the right base. Preflight
     # diffs against origin/master and fetches it itself, so origin points at PostHog here. Its migrations check needs

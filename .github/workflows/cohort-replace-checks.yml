@@ -345,7 +345,7 @@ jobs:
                   sqlx database create
                   sqlx migrate run --source persons_migrations/
 
-            - name: Test personhog-replica and personhog-router
+            - name: Test personhog-replica and personhog-router, and compile property-defs-rs tests
               env:
                   OPENSSL_NO_VENDOR: '1'
               run: |
@@ -355,6 +355,8 @@ jobs:
                       echo "apt attempt $attempt failed"; sleep 30
                   done
                   cargo test -p personhog-replica -p personhog-router --locked
+                  # property-defs-rs implements the PersonHogService mock in its tests, so a new RPC must compile there too.
+                  cargo test -p property-defs-rs --locked --no-run
 
     node:
         name: OpenAPI and MCP codegen drift, MCP tests

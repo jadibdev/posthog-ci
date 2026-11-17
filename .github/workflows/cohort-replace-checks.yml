@@ -22,8 +22,8 @@ on:
                 description: Branch, tag or full commit SHA of jadibdev/posthog to check
                 required: true
             commits:
-                description: How many commits at the tip of the ref to lint one by one (the branch's own commits)
-                required: true
+                description: Ignored (kept for dispatch compatibility; lint uses the merge base with PostHog master)
+                required: false
                 default: '10'
             tests:
                 description: Run the test suites (false runs only the lint job)
@@ -97,8 +97,16 @@ jobs:
               with:
                   repository: ${{ env.SOURCE_REPO }}
                   ref: ${{ inputs.ref }}
-                  # Enough history to lint the branch's commits one by one.
-                  fetch-depth: 60
+
+            - name: Find the merge base with PostHog's master
+              run: |
+                  head=$(git rev-parse HEAD)
+                  git fetch --no-tags --shallow-since="30 days ago" "https://github.com/${SOURCE_REPO}.git" "$head"
+                  git fetch --no-tags --shallow-since="30 days ago" https://github.com/PostHog/posthog.git +master:refs/remotes/posthog/master
+                  base=$(git merge-base posthog/master HEAD)
+                  echo "HEAD:           $head"
+                  echo "PostHog master: $(git rev-parse posthog/master)"
+                  echo "merge base:     $base"
 
             - name: Set up Python
               uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -123,14 +131,12 @@ jobs:
               run: UV_PROJECT_ENVIRONMENT=$pythonLocation timeout --kill-after=10s "$PY_DEPS_SYNC_TIMEOUT" uv sync --frozen --dev
 
             - name: Each commit imports cleanly (no undefined, unused or redefined names)
-              env:
-                  COMMITS: ${{ inputs.commits }}
               run: |
                   set -uo pipefail
-                  base=$(git rev-parse "HEAD~${COMMITS}")
-                  echo "Checking $(git rev-list --count "$base..HEAD") commits after $(git log -1 --format='%h %s' "$base")"
+                  base=$(git merge-base HEAD posthog/master)
+                  echo "Checking $(git rev-list --count --no-merges posthog/master..HEAD) commits since merge base $(git log -1 --format='%h %s' "$base")"
                   findings=0
-                  for c in $(git rev-list --reverse "$base..HEAD"); do
+                  for c in $(git rev-list --reverse --no-merges posthog/master..HEAD); do
                       echo "::group::$(git log -1 --format='%h %s' "$c")"
                       for f in $(git diff-tree --no-commit-id --name-only --diff-filter=d -r "$c" -- '*.py'); do
                           out=$(git show "$c:$f" | ruff check --select F821,F401,F811,F841 --stdin-filename "$f" --output-format concise -q - || true)
@@ -143,10 +149,13 @@ jobs:
 
             - name: ruff on the files the branch changes
               if: ${{ !cancelled() }}
-              env:
-                  COMMITS: ${{ inputs.commits }}
               run: |
-                  files=$(git diff --name-only --diff-filter=d "HEAD~${COMMITS}" HEAD -- '*.py')
+                  base=$(git merge-base HEAD posthog/master)
+                  files=$(git diff --name-only --diff-filter=d "$base" HEAD -- '*.py')
+                  if [ -z "$files" ]; then
+                      echo "No changed Python files."
+                      exit 0
+                  fi
                   echo "$files"
                   ruff check $files
                   ruff format --check $files

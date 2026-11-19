@@ -187,8 +187,8 @@ jobs:
                     {"group":"tasks","split":"","paths":"posthog/tasks/test posthog/test/test_cohort_model.py posthog/personhog_client/test_fake_client.py"},
                     {"group":"models-1","split":"--splits 2 --group 1","paths":"posthog/models"},
                     {"group":"models-2","split":"--splits 2 --group 2","paths":"posthog/models"},
-                    {"group":"products-1","split":"--splits 2 --group 1","paths":"products/cohorts products/feature_flags"},
-                    {"group":"products-2","split":"--splits 2 --group 2","paths":"products/cohorts products/feature_flags"}
+                    {"group":"products-1","split":"--splits 2 --group 1","paths":"products/cohorts products/feature_flags products/workflows/backend/tests/api/test_workflow_static_cohort_members_api.py"},
+                    {"group":"products-2","split":"--splits 2 --group 2","paths":"products/cohorts products/feature_flags products/workflows/backend/tests/api/test_workflow_static_cohort_members_api.py"}
                     ]' || '[{"group":"targeted"}]') }}
         steps:
             - name: Free disk space for the service images
@@ -279,7 +279,10 @@ jobs:
 
             - name: Cohort API suite
               if: ${{ !cancelled() && matrix.group == 'targeted' }}
-              run: pytest -p no:cacheprovider --reuse-db -q --junitxml=junit-api-cohort.xml posthog/api/test/test_cohort.py
+              run: >-
+                  pytest -p no:cacheprovider --reuse-db -q --junitxml=junit-api-cohort.xml
+                  posthog/api/test/test_cohort.py
+                  products/workflows/backend/tests/api/test_workflow_static_cohort_members_api.py
 
             - name: Suites for files upstream also changed (resource-transfer snapshot, flags cache)
               if: ${{ !cancelled() && matrix.group == 'targeted' }}

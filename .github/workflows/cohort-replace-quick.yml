@@ -3,7 +3,9 @@
 # question, or a throwaway branch per mutation.
 #
 # The setup mirrors the tests job of cohort-replace-checks.yml; keep the two in step. The migrated test database is
-# restored from the cache when no migration file has changed, which saves about 17 minutes.
+# restored from the cache when no file under any migrations folder has changed, which saves about 17 minutes. That
+# makes this an iteration tool: the gate before a reviewer-visible push is a broad cohort-replace-checks run, which
+# never uses the cache and migrates every job from scratch.
 #
 #   gh workflow run cohort-replace-quick.yml -R jadibdev/posthog-ci -f ref=<branch or sha> \
 #       -f targets="products/cohorts/backend/test/test_facade_api.py" -f mutations=mutations/r7
@@ -128,7 +130,7 @@ jobs:
               uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
               with:
                   path: ${{ runner.temp }}/test_posthog.dump
-                  key: test-db-v1-${{ hashFiles('**/migrations/*.py', '**/migrations/max_migration.txt', 'uv.lock', 'docker-compose.dev.yml') }}
+                  key: test-db-v2-${{ hashFiles('**/migrations/**', 'uv.lock', 'docker-compose.dev.yml') }}
 
             - name: Migrate test_posthog, from the cache when the migrations are unchanged
               env:

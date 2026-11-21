@@ -28,7 +28,8 @@ gh workflow run cohort-replace-quick.yml -R jadibdev/posthog-ci -f ref=<branch o
 
 ## Where the time goes, and which run to start
 
-- **Migrating the test database takes about 17 minutes of each test job's 27.** Both workflows cache the migrated database, keyed by every migration file, `uv.lock` and `docker-compose.dev.yml`. The first job after a migration changes migrates from scratch and saves the dump; later jobs restore it in seconds. A migration change on the branch still gets one full migration from scratch.
+- **Migrating the test database takes about 17 minutes of each test job's 27.** The quick workflow and targeted runs cache the migrated database, keyed by every file under any `migrations/` folder, `uv.lock` and `docker-compose.dev.yml`. The first job after any of those changes migrates from scratch and saves the dump; later jobs restore it in seconds. The dump is taken right after migrating, before any test runs.
+- **A broad run never uses the cache.** It's the gate before a reviewer-visible push, so every job migrates from scratch on a fresh runner, as before. Everything else in every run is fresh too: the runner, the checkout, the service containers, the Python dependencies, ClickHouse and the persons database. The cache only shortens iteration. A migration whose result depends on app code outside `migrations/` could make a cached run test a stale schema, and the broad run would still catch it.
 - **Caches made on `main` are shared** with every run; caches made on another branch of this repo aren't.
 - **Runs of `cohort-replace-checks.yml` on the same ref queue behind each other** (its concurrency group). The broad groups already include the targeted suites, so never start a targeted run next to a broad one.
 - **Which to start:**

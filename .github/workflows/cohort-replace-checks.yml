@@ -258,12 +258,15 @@ jobs:
 
             # As PostHog's CI does, the migration chain runs in its own process, then pytest adopts the database. Keep these
             # steps the same as in cohort-replace-quick.yml, so both workflows share one cache entry.
+            # A broad run is the gate before a reviewer-visible push, so it never touches the cache: every job migrates
+            # from scratch, as before. Only targeted runs restore and save the migrated database.
             - name: Restore the migrated test database
               id: db-cache
+              if: ${{ !inputs.broad }}
               uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
               with:
                   path: ${{ runner.temp }}/test_posthog.dump
-                  key: test-db-v1-${{ hashFiles('**/migrations/*.py', '**/migrations/max_migration.txt', 'uv.lock', 'docker-compose.dev.yml') }}
+                  key: test-db-v2-${{ hashFiles('**/migrations/**', 'uv.lock', 'docker-compose.dev.yml') }}
 
             - name: Migrate test_posthog, from the cache when the migrations are unchanged
               env:
@@ -291,11 +294,11 @@ jobs:
                   echo "DB_RESTORED=$restored" >> "$GITHUB_ENV"
 
             - name: Dump the migrated test database for the cache
-              if: ${{ steps.db-cache.outputs.cache-hit != 'true' }}
+              if: ${{ !inputs.broad && steps.db-cache.outputs.cache-hit != 'true' }}
               run: docker compose -f docker-compose.dev.yml exec -T db pg_dump -U posthog -Fc test_posthog > "$RUNNER_TEMP/test_posthog.dump"
 
             - name: Save the migrated test database
-              if: ${{ steps.db-cache.outputs.cache-hit != 'true' }}
+              if: ${{ !inputs.broad && steps.db-cache.outputs.cache-hit != 'true' }}
               # Parallel jobs race to save the same key; losing that race is fine.
               continue-on-error: true
               uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -1,0 +1,11 @@
+--- a/posthog/models/person/sql.py
++++ b/posthog/models/person/sql.py
+@@ -591,7 +591,7 @@
+ # rows sit below the range and a newer run's rows above it, whoever released the cohort in between.
+ DELETE_STATIC_COHORT_ROWS_BETWEEN_MARKERS = (
+     f"DELETE FROM {PERSON_STATIC_COHORT_TABLE} WHERE team_id = %(team_id)s AND cohort_id = %(cohort_id)s"
+-    " AND _offset = %(replace_offset)s AND _timestamp >= %(from_marker)s AND _timestamp <= %(to_marker)s"
++    " AND _offset = %(replace_offset)s AND _timestamp >= %(from_marker)s"
+ )
+ 
+ #

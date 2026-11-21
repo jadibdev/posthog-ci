@@ -1,0 +1,2 @@
+# The failed-replace cleanup without its upper bound deletes a newer run's rows.
+posthog/tasks/test/test_calculate_cohort.py::TestCohortCalculationTasks::test_failed_replace_cleanup_keeps_rows_a_newer_run_writes_after_its_marker

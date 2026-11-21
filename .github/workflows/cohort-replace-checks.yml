@@ -256,14 +256,52 @@ jobs:
                   bin/ci-wait-for-docker wait objectstorage \
                     || { echo "::group::compose launch log"; cat "$RUNNER_TEMP/compose-launch.log" || true; echo "::endgroup::"; exit 1; }
 
-            - name: Migrate test_posthog from scratch
-              # As PostHog's CI does: the full migration chain runs in its own process, then pytest adopts the database.
+            # As PostHog's CI does, the migration chain runs in its own process, then pytest adopts the database. Keep these
+            # steps the same as in cohort-replace-quick.yml, so both workflows share one cache entry.
+            - name: Restore the migrated test database
+              id: db-cache
+              uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ${{ runner.temp }}/test_posthog.dump
+                  key: test-db-v1-${{ hashFiles('**/migrations/*.py', '**/migrations/max_migration.txt', 'uv.lock', 'docker-compose.dev.yml') }}
+
+            - name: Migrate test_posthog, from the cache when the migrations are unchanged
               env:
                   DATABASE_URL: postgres://posthog:posthog@localhost:5432/test_posthog
+                  CACHE_HIT: ${{ steps.db-cache.outputs.cache-hit }}
               run: |
-                  docker compose -f docker-compose.dev.yml exec -T db psql -U posthog postgres \
-                    -c "DROP DATABASE IF EXISTS test_posthog;" -c "CREATE DATABASE test_posthog;"
+                  fresh_db() {
+                      docker compose -f docker-compose.dev.yml exec -T db psql -U posthog postgres -v ON_ERROR_STOP=1 \
+                        -c "DROP DATABASE IF EXISTS test_posthog;" -c "CREATE DATABASE test_posthog;"
+                  }
+                  fresh_db
+                  restored=false
+                  if [ "$CACHE_HIT" = "true" ]; then
+                      if docker compose -f docker-compose.dev.yml exec -T db \
+                          pg_restore -U posthog -d test_posthog --no-owner --exit-on-error < "$RUNNER_TEMP/test_posthog.dump"; then
+                          restored=true
+                          echo "Restored the migrated database from the cache."
+                      else
+                          echo "::warning::Restoring the cached database failed; migrating from scratch."
+                          fresh_db
+                      fi
+                  fi
+                  # After a restore this applies nothing; it would apply any migration the dump lacks.
                   python manage.py migrate
+                  echo "DB_RESTORED=$restored" >> "$GITHUB_ENV"
+
+            - name: Dump the migrated test database for the cache
+              if: ${{ steps.db-cache.outputs.cache-hit != 'true' }}
+              run: docker compose -f docker-compose.dev.yml exec -T db pg_dump -U posthog -Fc test_posthog > "$RUNNER_TEMP/test_posthog.dump"
+
+            - name: Save the migrated test database
+              if: ${{ steps.db-cache.outputs.cache-hit != 'true' }}
+              # Parallel jobs race to save the same key; losing that race is fine.
+              continue-on-error: true
+              uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  path: ${{ runner.temp }}/test_posthog.dump
+                  key: ${{ steps.db-cache.outputs.cache-primary-key }}
 
             - name: No missing or conflicting migrations
               env:

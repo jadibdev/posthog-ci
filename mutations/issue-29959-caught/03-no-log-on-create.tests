@@ -1,0 +1,2 @@
+posthog/api/test/test_cohort.py::TestCohort::test_cohort_activity_log
+posthog/api/test/test_cohort.py::TestCohort::test_create_static_cohort_activity_log

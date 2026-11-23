@@ -1,0 +1,11 @@
+--- a/posthog/api/cohort.py
++++ b/posthog/api/cohort.py
+@@ -3415,7 +3415,7 @@
+             elif bool(deleted_change.before):
+                 activity = "restored"
+ 
+-        log_activity(
++        (lambda **_: None)(
+             organization_id=self.organization.id,
+             team_id=self.team_id,
+             user=serializer.context["request"].user,

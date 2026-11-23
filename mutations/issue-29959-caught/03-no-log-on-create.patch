@@ -1,0 +1,11 @@
+--- a/posthog/api/cohort.py
++++ b/posthog/api/cohort.py
+@@ -3380,7 +3380,7 @@
+         serializer.save()
+         instance = cast(Cohort, serializer.instance)
+ 
+-        log_activity(
++        (lambda **_: None)(
+             organization_id=self.organization.id,
+             team_id=self.team_id,
+             user=serializer.context["request"].user,

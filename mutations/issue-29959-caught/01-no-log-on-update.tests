@@ -1,0 +1,3 @@
+posthog/api/test/test_cohort.py::TestCohort::test_cohort_activity_log
+posthog/api/test/test_cohort.py::TestCohort::test_update_static_cohort_activity_log
+posthog/api/test/test_cohort.py::TestCohort::test_cohort_delete_restore_logs_activity

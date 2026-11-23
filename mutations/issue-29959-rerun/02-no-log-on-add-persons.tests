@@ -1,0 +1,1 @@
+posthog/api/test/test_cohort.py::TestCohort::test_add_persons_to_static_cohort

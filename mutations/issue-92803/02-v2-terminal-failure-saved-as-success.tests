@@ -1,0 +1,3 @@
+posthog/tasks/test/test_calculate_cohort.py
+-k
+records_a_transient_failure_once_retries_run_out or records_failure_when_nothing_will_retry

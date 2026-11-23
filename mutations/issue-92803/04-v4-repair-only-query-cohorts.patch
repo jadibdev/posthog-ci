@@ -1,0 +1,11 @@
+--- a/products/cohorts/backend/static_reconciliation.py
++++ b/products/cohorts/backend/static_reconciliation.py
+@@ -229,7 +229,7 @@
+     settled_before = now - RECONCILE_SETTLE_DELAY
+     return (
+         # A failed population leaves a partial set in ClickHouse, and copying it would make flags match that set.
+-        Cohort.objects.filter(is_static=True, deleted=False, is_calculating=False, errors_calculating=0)
++        Cohort.objects.filter(is_static=True, deleted=False, is_calculating=False, errors_calculating=0, query__isnull=False)
+         .filter(
+             Q(last_calculation__lte=settled_before) | Q(last_calculation__isnull=True, created_at__lte=settled_before)
+         )

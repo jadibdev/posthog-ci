@@ -1,0 +1,13 @@
+--- a/posthog/tasks/calculate_cohort.py
++++ b/posthog/tasks/calculate_cohort.py
+@@ -697,9 +697,7 @@
+ def _is_transient_population_error(err: BaseException) -> bool:
+     # Static population runs the same ORM statements as recalculation, so it shares the Postgres
+     # legs: a pooler blip between two personhog batches must not be recorded as a permanent failure.
+-    return isinstance(err, STATIC_POPULATION_TRANSIENT_ERRORS) or is_transient_rpc_error(
+-        err, codes=STATIC_POPULATION_RETRYABLE_RPC_CODES
+-    )
++    return isinstance(err, STATIC_POPULATION_TRANSIENT_ERRORS)
+ 
+ 
+ def _is_final_attempt(task: Task, retryable: bool) -> bool:

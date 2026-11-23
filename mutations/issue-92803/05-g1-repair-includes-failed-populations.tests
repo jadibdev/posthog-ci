@@ -1,0 +1,3 @@
+products/cohorts/backend/test/test_static_reconciliation.py
+-k
+dispatches_only_settled_cohorts_whose_postgres_count_lags

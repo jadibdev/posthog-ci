@@ -1,0 +1,11 @@
+--- a/products/cohorts/backend/static_reconciliation.py
++++ b/products/cohorts/backend/static_reconciliation.py
+@@ -410,7 +410,7 @@
+ 
+     # min_rows makes the copy wait for a replica that holds every row instead of storing a partial copy.
+     try:
+-        insert_cohort_people_into_pg(row, team_id=cohort.team_id, min_rows=members.people)
++        pass
+     finally:
+         # A member removed during the copy may still be in ClickHouse, so the copy can bring it back, also when it
+         # fails partway.

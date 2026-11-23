@@ -1,0 +1,11 @@
+--- a/posthog/api/cohort.py
++++ b/posthog/api/cohort.py
+@@ -1518,7 +1518,7 @@
+     def get_last_error_message(self, cohort: Cohort) -> Optional[str]:
+         # A static cohort is populated once, and nothing re-runs it afterwards, so the messages
+         # that promise an automatic retry must not reach one.
+-        will_retry = not cohort.is_static
++        will_retry = True
+ 
+         # Prefer the annotated last_error_code when available
+         if hasattr(cohort, "last_error_code"):

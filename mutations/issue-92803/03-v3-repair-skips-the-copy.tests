@@ -1,0 +1,3 @@
+products/cohorts/backend/test/test_static_reconciliation.py
+-k
+sweep_copies_clickhouse_members_to_postgres_unless_switched_off

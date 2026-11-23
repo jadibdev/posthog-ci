@@ -1,0 +1,3 @@
+posthog/tasks/test/test_calculate_cohort.py
+-k
+retries_a_transient_failure or leaves_state_untouched_while_retries_remain or retry_after_transient_failure_completes

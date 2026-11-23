@@ -1,0 +1,11 @@
+--- a/posthog/api/cohort.py
++++ b/posthog/api/cohort.py
+@@ -3409,7 +3409,7 @@
+         changes = dict_changes_between("Cohort", previous=before_update, new=instance.to_dict())
+         activity = "updated"
+         deleted_change = next((change for change in changes if change.field == "deleted"), None)
+-        if deleted_change:
++        if False:
+             if bool(deleted_change.after):
+                 activity = "deleted"
+             elif bool(deleted_change.before):

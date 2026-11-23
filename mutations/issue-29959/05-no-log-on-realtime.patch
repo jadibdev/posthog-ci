@@ -1,0 +1,11 @@
+--- a/posthog/api/cohort.py
++++ b/posthog/api/cohort.py
+@@ -3299,7 +3299,7 @@
+         cohort.refresh_from_db()
+         changes = dict_changes_between("Cohort", previous=before, new=cohort.to_dict())
+         if changes:
+-            log_activity(
++            (lambda **_: None)(
+                 organization_id=self.organization.id,
+                 team_id=self.team_id,
+                 user=cast(User, request.user),

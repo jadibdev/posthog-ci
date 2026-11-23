@@ -1,0 +1,1 @@
+posthog/api/test/test_cohort.py::TestCohort::test_remove_person_from_static_cohort
